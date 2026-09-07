@@ -1,0 +1,31 @@
+﻿# ==============================================================================
+# فن اللامبالاة - Automated Video Generation Pipeline - Python Dependencies
+# ==============================================================================
+
+# Anthropic Claude API - Script & visual prompt generation
+anthropic>=0.40.0
+
+# Microsoft Edge TTS - Arabic text-to-speech synthesis
+edge-tts>=6.1.9
+
+# MoviePy - Video assembly (requires ffmpeg system package)
+# NOTE: Pinned to 1.0.3 - newer versions have breaking API changes
+moviepy==1.0.3
+
+# HTTP client - Image fetching & Telegram delivery
+requests>=2.31.0
+
+# Pillow - Image processing backend for MoviePy
+# NOTE: Capped at <10.0.0 - moviepy 1.0.3 uses Image.ANTIALIAS (removed in Pillow 10)
+Pillow>=9.0.0,<10.0.0
+
+# NumPy - Array operations required by MoviePy
+# NOTE: Capped at <2.0.0 for MoviePy 1.0.3 compatibility
+numpy>=1.24.0,<2.0.0
+
+# ImageIO - Image I/O backend for MoviePy
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+
+# Decorator - Internal MoviePy dependency
+decorator>=4.4.2
