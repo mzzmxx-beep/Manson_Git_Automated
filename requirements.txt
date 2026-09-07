@@ -1,12 +1,12 @@
-﻿# ==============================================================================
+# ==============================================================================
 # فن اللامبالاة - Automated Video Generation Pipeline - Python Dependencies
 # ==============================================================================
 
 # Anthropic Claude API - Script & visual prompt generation
 anthropic>=0.40.0
 
-# Microsoft Edge TTS - Arabic text-to-speech synthesis
-edge-tts>=6.1.9
+# ElevenLabs TTS - Iraqi Arabic voiceover (replaces edge-tts)
+elevenlabs>=1.0.0
 
 # MoviePy - Video assembly (requires ffmpeg system package)
 # NOTE: Pinned to 1.0.3 - newer versions have breaking API changes

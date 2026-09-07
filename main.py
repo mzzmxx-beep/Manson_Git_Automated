@@ -1,31 +1,31 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Automated Vertical Video Generation Pipeline - فن اللامبالاة
 =============================================================
 Book: "The Subtle Art of Not Giving a F*ck" by Mark Manson
-Content Style: Motivational / Self-improvement (NOT storytelling)
+Content Style: Motivational / Self-improvement — Iraqi Arabic dialect
+TTS: ElevenLabs (eleven_multilingual_v2)
 
 Pipeline:
-  1. Generate today's episode key lesson, motivational script, vibrant visual
-     prompts, TikTok caption, hashtags, and a running summary via Claude
-  2. Generate Arabic voiceover (TTS) via Edge-TTS
-  3. Fetch 4 AI-generated vibrant images from Pollinations.ai
+  1. Generate today's episode key lesson + motivational script (Iraqi dialect)
+     via Anthropic Claude
+  2. Generate Arabic voiceover via ElevenLabs TTS
+  3. Fetch 4 vibrant AI-generated images from Pollinations.ai
   4. Assemble images + audio into a 9:16 MP4 via MoviePy
-  5. Send the final video (with caption + hashtags) to a Telegram chat
-     for manual posting to TikTok
-  6. Persist episode progress to book_state.json so the next run
-     covers the next lesson instead of repeating it
+  5. Send the final video to Telegram for manual TikTok posting
+  6. Persist episode progress to book_state.json
 
 Environment Variables Required:
-  - ANTHROPIC_API_KEY   : Anthropic API key
-  - TELEGRAM_BOT_TOKEN  : Telegram Bot token from @BotFather
-  - TELEGRAM_CHAT_ID    : Target Telegram chat/channel ID
+  - ANTHROPIC_API_KEY     : Anthropic API key
+  - ELEVENLABS_API_KEY    : ElevenLabs API key
+  - ELEVENLABS_VOICE_ID   : ElevenLabs voice ID (optional — defaults to Arabic preset)
+  - TELEGRAM_BOT_TOKEN    : Telegram Bot token from @BotFather
+  - TELEGRAM_CHAT_ID      : Target Telegram chat/channel ID
 """
 
 import json
 import os
 import sys
-import asyncio
 import logging
 import random
 import re
@@ -34,12 +34,10 @@ import urllib.parse
 
 import requests
 from anthropic import Anthropic
-import edge_tts
+from elevenlabs.client import ElevenLabs
 import numpy as np
 from moviepy.editor import (
-    ImageClip,
     AudioFileClip,
-    concatenate_videoclips,
     VideoClip,
     CompositeVideoClip,
 )
@@ -61,7 +59,6 @@ logger = logging.getLogger(__name__)
 VIDEO_WIDTH = 1080
 VIDEO_HEIGHT = 1920
 VIDEO_FPS = 30
-TTS_VOICE = "ar-SA-HamedNeural"
 AUDIO_OUTPUT = "voiceover.mp3"
 VIDEO_OUTPUT = "final_video.mp4"
 NUM_IMAGES = 4
@@ -73,11 +70,17 @@ STATE_FILE = "book_state.json"
 BOOK_TITLE = "فن اللامبالاة"
 BOOK_AUTHOR = "مارك مانسون"
 
+# ElevenLabs — eleven_multilingual_v2 supports Iraqi Arabic well.
+# "Omar" is a warm Iraqi-accented male voice available in ElevenLabs.
+# Override by setting ELEVENLABS_VOICE_ID secret in GitHub.
+ELEVENLABS_DEFAULT_VOICE_ID = "IKne3meq5aSn9XLyUdCD"   # "Charlie" multilingual
+ELEVENLABS_MODEL = "eleven_multilingual_v2"
+
 # ---------------------------------------------------------------------------
-# Claude prompt template — Motivational content style (NOT storytelling)
+# Claude prompt — Iraqi Arabic dialect, motivational life-coach style
 # ---------------------------------------------------------------------------
 CLAUDE_PROMPT_TEMPLATE = (
-    "You are an expert Arabic motivational content creator and life-coach\n"
+    "You are an expert Iraqi Arabic motivational content creator and life-coach\n"
     "producing a daily short-video series based on the internationally\n"
     "acclaimed self-help book 'The Subtle Art of Not Giving a F*ck'\n"
     "by Mark Manson, for TikTok/Reels (9:16 vertical, ~60 seconds).\n\n"
@@ -86,44 +89,42 @@ CLAUDE_PROMPT_TEMPLATE = (
     '"""\n{previous_summary}\n"""\n\n'
     "Task:\n"
     "1. Choose the NEXT KEY LESSON or concept from the book that has NOT\n"
-    "   been covered yet according to the summary above.\n"
-    "   Write a powerful, energetic, motivational Arabic script (Modern\n"
-    "   Standard Arabic with some relatable colloquial touches).\n"
-    "   The tone must be:\n"
-    "     - Encouraging, empowering, and direct (like a life coach speaking)\n"
-    "     - NOT a story narration — speak directly TO the viewer\n"
-    "     - Use short punchy sentences with rhythm and impact\n"
-    "     - Include a memorable takeaway or call-to-action at the end\n"
-    "   Keep it under 150 words so it fits in ~60 seconds when narrated.\n\n"
+    "   been covered yet according to the summary above.\n\n"
+    "   Write a powerful, energetic, motivational script in IRAQI ARABIC DIALECT\n"
+    "   (اللهجة العراقية العامية). IMPORTANT dialect rules:\n"
+    "     - Use Iraqi colloquial words naturally: گال، شنو، هواية، ماكو، اكو،\n"
+    "       بيها، عليها، ياخي، دشناك، چي، گلبك، روحك، هسه، بعدين، لازم\n"
+    "     - Speak directly TO the viewer (inta / anti) like a real Iraqi life-coach\n"
+    "     - Short punchy sentences with Iraqi rhythm and energy\n"
+    "     - Warm, direct, encouraging — like a knowledgeable Iraqi friend\n"
+    "     - Include a memorable Iraqi-flavored call-to-action at the end\n"
+    "   Keep it under 150 words to fit ~60 seconds when narrated.\n\n"
     "2. After the script, provide exactly 4 distinct English visual prompts\n"
-    "   for AI image generation. Each prompt MUST describe a VIBRANT,\n"
-    "   MODERN, BRIGHT, UPLIFTING scene that visually represents the\n"
-    "   lesson's concept. Style requirements for ALL images:\n"
+    "   for AI image generation. Each MUST describe a VIBRANT, MODERN,\n"
+    "   BRIGHT, UPLIFTING scene. Style requirements:\n"
     "     - Ultra-bright, high-saturation color palette\n"
     "     - Modern minimalist or neon aesthetic\n"
     "     - Motivational and inspirational atmosphere\n"
     "     - Contemporary lifestyle or abstract visualization\n"
     "     - No dark or gloomy elements — pure energy and positivity\n"
-    "     - 9:16 vertical format, cinematic quality, photorealistic\n"
-    "   Example styles: golden hour cityscapes, vibrant geometric art,\n"
-    "   neon-lit modern interiors, energetic athletic scenes, sunrise\n"
-    "   mountain peaks, glowing abstract particles, bold typography art.\n\n"
-    "3. Write a short, punchy Arabic caption (max 2 sentences) for the\n"
-    "   TikTok post: a bold motivational statement that makes people STOP scrolling.\n\n"
+    "     - 9:16 vertical format, cinematic quality, photorealistic\n\n"
+    "3. Write a short punchy Arabic caption (max 2 sentences) for TikTok:\n"
+    "   a bold motivational statement that makes people STOP scrolling.\n"
+    "   Can mix Iraqi dialect with Modern Standard Arabic.\n\n"
     "4. Provide 7-10 relevant hashtags (mix of Arabic and English),\n"
     "   space-separated, each starting with #.\n\n"
     "5. Write a concise 1-2 sentence summary of WHICH LESSON was covered\n"
     "   in this episode, for continuity context in the next run.\n\n"
     "Format your response EXACTLY as follows (do not deviate):\n\n"
     "---SCRIPT---\n"
-    "[Arabic motivational script here]\n\n"
+    "[Iraqi Arabic motivational script here]\n\n"
     "---PROMPTS---\n"
     "1. [First English visual prompt]\n"
     "2. [Second English visual prompt]\n"
     "3. [Third English visual prompt]\n"
     "4. [Fourth English visual prompt]\n\n"
     "---CAPTION---\n"
-    "[Arabic motivational caption here]\n\n"
+    "[Arabic caption here]\n\n"
     "---HASHTAGS---\n"
     "[hashtags here]\n\n"
     "---SUMMARY---\n"
@@ -132,15 +133,13 @@ CLAUDE_PROMPT_TEMPLATE = (
 
 
 # ===========================================================================
-# BOOK STATE - Track episode/lesson progress across daily runs
+# BOOK STATE
 # ===========================================================================
 def load_book_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
-        logger.info(
-            "Loaded book state: episode {}.".format(state.get("episode", 0) + 1)
-        )
+        logger.info("Loaded book state: episode {}.".format(state.get("episode", 0) + 1))
         return state
     logger.info("No existing book state found. Starting from episode 1.")
     return {"episode": 0, "summary": ""}
@@ -184,22 +183,20 @@ def generate_script_and_prompts(episode_number, previous_summary):
             if not text_blocks:
                 raise ValueError("No text block found in Claude response.")
             raw_text = "".join(text_blocks)
-            logger.info("Claude response received from {}.".format(CLAUDE_MODEL))
+            logger.info("Claude response received.")
             break
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "rate" in err_str.lower() or "overloaded" in err_str.lower():
                 wait_sec = 65 * attempt
-                logger.warning(
-                    "Rate-limit/overload on attempt {}/3. Waiting {}s...".format(attempt, wait_sec)
-                )
+                logger.warning("Rate-limit on attempt {}/3. Waiting {}s...".format(attempt, wait_sec))
                 time.sleep(wait_sec)
             else:
                 logger.error("Claude error: {}".format(e))
                 raise
 
     if not raw_text:
-        raise RuntimeError("Claude API exhausted after retries. Check API key and rate limits.")
+        raise RuntimeError("Claude API exhausted after retries.")
 
     script_match = re.search(r"---SCRIPT---\s*(.*?)\s*---PROMPTS---", raw_text, re.DOTALL)
     if not script_match:
@@ -219,27 +216,24 @@ def generate_script_and_prompts(episode_number, previous_summary):
             prompts.append(match.group(1).strip())
 
     if len(prompts) < NUM_IMAGES:
-        raise ValueError(
-            "Expected {} visual prompts, got {}. Raw:\n{}".format(NUM_IMAGES, len(prompts), prompts_raw)
-        )
+        raise ValueError("Expected {} visual prompts, got {}.".format(NUM_IMAGES, len(prompts)))
 
     caption_match = re.search(r"---CAPTION---\s*(.*?)\s*---HASHTAGS---", raw_text, re.DOTALL)
     if not caption_match:
-        raise ValueError("Could not parse caption from Claude response.")
+        raise ValueError("Could not parse caption.")
     caption = caption_match.group(1).strip()
 
     hashtags_match = re.search(r"---HASHTAGS---\s*(.*?)\s*---SUMMARY---", raw_text, re.DOTALL)
     if not hashtags_match:
-        raise ValueError("Could not parse hashtags from Claude response.")
+        raise ValueError("Could not parse hashtags.")
     hashtags = hashtags_match.group(1).strip()
 
     summary_match = re.search(r"---SUMMARY---\s*(.*)", raw_text, re.DOTALL)
     if not summary_match:
-        raise ValueError("Could not parse episode summary from Claude response.")
+        raise ValueError("Could not parse episode summary.")
     episode_summary = summary_match.group(1).strip()
 
-    logger.info("Script parsed successfully ({} chars).".format(len(script)))
-    logger.info("Extracted {} visual prompts.".format(len(prompts)))
+    logger.info("Script parsed ({} chars), {} prompts extracted.".format(len(script), len(prompts)))
     return {
         "script": script,
         "prompts": prompts[:NUM_IMAGES],
@@ -250,28 +244,53 @@ def generate_script_and_prompts(episode_number, previous_summary):
 
 
 # ===========================================================================
-# STEP 2 - Text-to-Speech / Arabic Voiceover (Edge-TTS)
+# STEP 2 - Text-to-Speech via ElevenLabs (Iraqi Arabic)
 # ===========================================================================
-async def _generate_tts_async(script, output_path):
-    communicate = edge_tts.Communicate(text=script, voice=TTS_VOICE)
-    await communicate.save(output_path)
-
-
 def generate_voiceover(script):
-    logger.info("=== STEP 2: Generating Arabic voiceover via Edge-TTS ===")
+    """
+    Generates an Iraqi Arabic voiceover MP3 using ElevenLabs TTS.
+    Uses eleven_multilingual_v2 model which handles Iraqi dialect well.
+    Voice ID is read from ELEVENLABS_VOICE_ID env var or defaults to preset.
+    """
+    logger.info("=== STEP 2: Generating Iraqi Arabic voiceover via ElevenLabs ===")
+
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    if not api_key:
+        raise EnvironmentError("ELEVENLABS_API_KEY environment variable is not set.")
+
+    voice_id = os.environ.get("ELEVENLABS_VOICE_ID", ELEVENLABS_DEFAULT_VOICE_ID)
+    logger.info("Using voice ID: {}".format(voice_id))
+
     try:
-        asyncio.run(_generate_tts_async(script, AUDIO_OUTPUT))
-        if not os.path.exists(AUDIO_OUTPUT):
-            raise FileNotFoundError("TTS output file not found: {}".format(AUDIO_OUTPUT))
+        client = ElevenLabs(api_key=api_key)
+
+        logger.info("Calling ElevenLabs TTS API...")
+        audio_generator = client.text_to_speech.convert(
+            voice_id=voice_id,
+            text=script,
+            model_id=ELEVENLABS_MODEL,
+            output_format="mp3_44100_128",
+        )
+
+        # Write audio bytes to file
+        with open(AUDIO_OUTPUT, "wb") as f:
+            for chunk in audio_generator:
+                if chunk:
+                    f.write(chunk)
+
+        if not os.path.exists(AUDIO_OUTPUT) or os.path.getsize(AUDIO_OUTPUT) == 0:
+            raise FileNotFoundError("ElevenLabs TTS output file is empty or missing.")
+
         size_kb = os.path.getsize(AUDIO_OUTPUT) / 1024
         logger.info("Voiceover saved: {} ({:.1f} KB)".format(AUDIO_OUTPUT, size_kb))
+
     except Exception as e:
-        logger.error("TTS generation failed: {}".format(e))
+        logger.error("ElevenLabs TTS generation failed: {}".format(e))
         raise
 
 
 # ===========================================================================
-# STEP 3 - Image Generation (Pollinations.ai) - Vibrant & Modern
+# STEP 3 - Image Generation (Pollinations.ai) — Vibrant & Modern
 # ===========================================================================
 def generate_images(prompts):
     logger.info("=== STEP 3: Fetching vibrant images from Pollinations.ai ===")
@@ -291,34 +310,30 @@ def generate_images(prompts):
         url = POLLINATIONS_BASE.format(prompt=encoded_prompt, seed=seed)
 
         logger.info("Fetching image {}/{}: {}...".format(idx + 1, NUM_IMAGES, prompt[:60]))
-        retries = 3
 
-        for attempt in range(1, retries + 1):
+        for attempt in range(1, 4):
             try:
                 response = requests.get(url, timeout=90)
                 response.raise_for_status()
                 with open(filename, "wb") as f:
                     f.write(response.content)
                 size_kb = os.path.getsize(filename) / 1024
-                logger.info("  Image {} saved: {} ({:.1f} KB)".format(idx + 1, filename, size_kb))
+                logger.info("  Image {} saved ({:.1f} KB)".format(idx + 1, size_kb))
                 image_paths.append(filename)
                 break
             except requests.RequestException as e:
-                logger.warning("  Attempt {}/{} failed: {}".format(attempt, retries, e))
-                if attempt < retries:
-                    wait_sec = 5 * attempt
-                    logger.info("  Retrying in {}s...".format(wait_sec))
-                    time.sleep(wait_sec)
+                logger.warning("  Attempt {}/3 failed: {}".format(attempt, e))
+                if attempt < 3:
+                    time.sleep(5 * attempt)
                 else:
-                    logger.error("  All {} attempts failed for image {}.".format(retries, idx + 1))
                     raise
 
-    logger.info("All {} images fetched successfully.".format(len(image_paths)))
+    logger.info("All {} images fetched.".format(len(image_paths)))
     return image_paths
 
 
 # ===========================================================================
-# STEP 4 - Video Assembly (MoviePy)
+# STEP 4 - Video Assembly (MoviePy) — Ken Burns + Crossfade
 # ===========================================================================
 def _make_ken_burns_frame(img_array, effect_type, duration, zoom_factor, w, h):
     def make_frame(t):
@@ -352,17 +367,15 @@ def _make_ken_burns_frame(img_array, effect_type, duration, zoom_factor, w, h):
         scaled_arr = np.array(scaled)
         base_x = (new_w - w) // 2
         base_y = (new_h - h) // 2
-        x_start = int(base_x + cx)
-        y_start = int(base_y + cy)
-        x_start = max(0, min(x_start, new_w - w))
-        y_start = max(0, min(y_start, new_h - h))
-        return scaled_arr[y_start : y_start + h, x_start : x_start + w]
+        x_start = max(0, min(int(base_x + cx), new_w - w))
+        y_start = max(0, min(int(base_y + cy), new_h - h))
+        return scaled_arr[y_start:y_start + h, x_start:x_start + w]
 
     return make_frame
 
 
 def assemble_video(image_paths, audio_path):
-    logger.info("=== STEP 4: Assembling video with MoviePy (Ken Burns + Crossfade) ===")
+    logger.info("=== STEP 4: Assembling video (Ken Burns + Crossfade) ===")
     FADE_DURATION = 0.5
     ZOOM_FACTOR = 1.12
     KB_EFFECTS = ["zoom_in", "zoom_out", "pan_right", "pan_left", "pan_up", "pan_down"]
@@ -374,16 +387,11 @@ def assemble_video(image_paths, audio_path):
 
         n = len(image_paths)
         per_image_duration = (total_duration + (n - 1) * FADE_DURATION) / n
-        logger.info(
-            "Each image will display for {:.2f}s ({} images, {:.1f}s crossfade)".format(
-                per_image_duration, n, FADE_DURATION
-            )
-        )
 
         raw_clips = []
         for idx, img_path in enumerate(image_paths):
             effect = KB_EFFECTS[idx % len(KB_EFFECTS)]
-            logger.info("  Building Ken Burns clip {}/{} (effect: {})".format(idx + 1, n, effect))
+            logger.info("  Building clip {}/{} ({})".format(idx + 1, n, effect))
             pil_img = (
                 PILImage.open(img_path)
                 .convert("RGB")
@@ -393,10 +401,8 @@ def assemble_video(image_paths, audio_path):
             make_frame = _make_ken_burns_frame(
                 img_array, effect, per_image_duration, ZOOM_FACTOR, VIDEO_WIDTH, VIDEO_HEIGHT
             )
-            clip = VideoClip(make_frame, duration=per_image_duration)
-            raw_clips.append(clip)
+            raw_clips.append(VideoClip(make_frame, duration=per_image_duration))
 
-        logger.info("Applying crossfade transitions ({:.1f}s each)...".format(FADE_DURATION))
         positioned_clips = []
         current_start = 0.0
         for i, clip in enumerate(raw_clips):
@@ -413,9 +419,7 @@ def assemble_video(image_paths, audio_path):
             .set_audio(audio_clip)
         )
 
-        logger.info(
-            "Exporting video: {} at {} fps (CRF=18, 8 Mbps, slow preset)...".format(VIDEO_OUTPUT, VIDEO_FPS)
-        )
+        logger.info("Exporting {} at {} fps...".format(VIDEO_OUTPUT, VIDEO_FPS))
         final_clip.write_videofile(
             VIDEO_OUTPUT,
             fps=VIDEO_FPS,
@@ -434,7 +438,7 @@ def assemble_video(image_paths, audio_path):
             clip.close()
 
         size_mb = os.path.getsize(VIDEO_OUTPUT) / (1024 * 1024)
-        logger.info("Video exported successfully: {} ({:.2f} MB)".format(VIDEO_OUTPUT, size_mb))
+        logger.info("Video exported: {} ({:.2f} MB)".format(VIDEO_OUTPUT, size_mb))
 
     except Exception as e:
         logger.error("Video assembly failed: {}".format(e))
@@ -472,22 +476,19 @@ def send_to_telegram(video_path, episode_number, tiktok_caption, hashtags):
 
     try:
         with open(video_path, "rb") as video_file:
-            logger.info("Uploading {} to Telegram...".format(video_path))
+            logger.info("Uploading to Telegram...")
             response = requests.post(
                 api_url,
                 data={"chat_id": chat_id, "caption": caption},
                 files={"video": video_file},
                 timeout=120,
             )
-
         response.raise_for_status()
         result = response.json()
-
         if result.get("ok"):
             logger.info("Video delivered to Telegram successfully!")
         else:
             raise RuntimeError("Telegram API error: {}".format(result))
-
     except Exception as e:
         logger.error("Telegram delivery failed: {}".format(e))
         raise
@@ -498,8 +499,7 @@ def send_to_telegram(video_path, episode_number, tiktok_caption, hashtags):
 # ===========================================================================
 def cleanup_temp_files(image_paths):
     logger.info("=== Cleaning up temporary files ===")
-    files_to_remove = list(image_paths) + [AUDIO_OUTPUT, VIDEO_OUTPUT]
-    for filepath in files_to_remove:
+    for filepath in list(image_paths) + [AUDIO_OUTPUT, VIDEO_OUTPUT]:
         if os.path.exists(filepath):
             try:
                 os.remove(filepath)
@@ -513,7 +513,7 @@ def cleanup_temp_files(image_paths):
 # ===========================================================================
 def main():
     logger.info("=" * 70)
-    logger.info("  فن اللامبالاة - AUTOMATED VIDEO GENERATION PIPELINE - STARTING")
+    logger.info("  فن اللامبالاة (Iraqi Dialect) — VIDEO PIPELINE STARTING")
     logger.info("=" * 70)
 
     image_paths = []
@@ -527,9 +527,7 @@ def main():
         generate_voiceover(episode["script"])
         image_paths = generate_images(episode["prompts"])
         assemble_video(image_paths, AUDIO_OUTPUT)
-        send_to_telegram(
-            VIDEO_OUTPUT, episode_number, episode["caption"], episode["hashtags"]
-        )
+        send_to_telegram(VIDEO_OUTPUT, episode_number, episode["caption"], episode["hashtags"])
         save_book_state(episode_number, episode["summary"])
 
         logger.info("=" * 70)
